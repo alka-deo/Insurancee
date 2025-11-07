@@ -1,0 +1,417 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import altair as alt
+from io import BytesIO
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+import base64
+
+st.set_page_config(layout="wide", page_title="HR Attrition Dashboard & Models")
+
+st.title("HR Attrition — Dashboard, Models & Prediction")
+st.markdown("""
+This app provides:
+- An interactive dashboard with 5 different charts and filters (job role, satisfaction slider).  
+- A Models tab to train **3 classification algorithms** and view performance metrics (train/test accuracy, confusion matrix, feature importance).  
+- A Predict tab to upload new data and generate attrition predictions (downloadable CSV).
+
+**Notes:** The app is flexible: on upload, you'll be asked to map which columns correspond to *Job Role*, *Satisfaction* and *Target/Attrition*. The app **drops rows with nulls** (ignores them) before modeling as requested.
+""")
+
+# --------------------- Helper functions ---------------------
+@st.cache_data
+def load_csv(file) -> pd.DataFrame:
+    return pd.read_csv(file)
+
+def try_guess_columns(df):
+    cols = list(df.columns)
+    guess = {}
+    lowered = {c.lower(): c for c in cols}
+    # job role guesses
+    for key in ("jobrole","job_role","job title","jobtitle","role","position"):
+        if key in lowered:
+            guess['job'] = lowered[key]
+            break
+    # satisfaction guesses
+    for key in ("satisfaction","satisfaction_level","satisfaction_score","employee_satisfaction","satisfication","satisfactionrate"):
+        if key in lowered:
+            guess['satisfaction'] = lowered[key]
+            break
+    # target guesses
+    for key in ("attrition","left","turnover","target","label","status","is_attrited"):
+        if key in lowered:
+            guess['target'] = lowered[key]
+            break
+    return guess
+
+def label_encode_df(df, drop_original=True):
+    encoders = {}
+    df2 = df.copy()
+    for col in df2.select_dtypes(include=['object','category']).columns:
+        le = LabelEncoder()
+        try:
+            df2[col] = df2[col].astype(str)
+            df2[col] = le.fit_transform(df2[col])
+            encoders[col] = le
+        except Exception:
+            pass
+    return df2, encoders
+
+def model_train_and_eval(X_train, X_test, y_train, y_test):
+    models = {
+        "LogisticRegression": LogisticRegression(max_iter=1000, random_state=42),
+        "RandomForest": RandomForestClassifier(n_estimators=200, random_state=42),
+        "GradientBoosting": GradientBoostingClassifier(n_estimators=200, random_state=42)
+    }
+    results = {}
+    for name, m in models.items():
+        m.fit(X_train, y_train)
+        y_tr_pred = m.predict(X_train)
+        y_te_pred = m.predict(X_test)
+        results[name] = {
+            "model": m,
+            "train_acc": accuracy_score(y_train, y_tr_pred),
+            "test_acc": accuracy_score(y_test, y_te_pred),
+            "y_test_pred": y_te_pred,
+            "y_train_pred": y_tr_pred
+        }
+    return results
+
+def plot_confusion(cm, labels, title="Confusion Matrix"):
+    fig, ax = plt.subplots(figsize=(4,4))
+    im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+    ax.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
+           xticklabels=labels, yticklabels=labels,
+           ylabel='True label', xlabel='Predicted label', title=title)
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+    fmt = 'd'
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], fmt),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    st.pyplot(fig)
+
+def plot_feature_importance(model, features, title="Feature Importance"):
+    if hasattr(model, "feature_importances_"):
+        imp = model.feature_importances_
+    elif hasattr(model, "coef_"):
+        coef = np.abs(model.coef_)
+        if coef.ndim > 1:
+            coef = coef.sum(axis=0)
+        imp = coef.flatten()
+        if imp.max() > 0:
+            imp = imp / imp.max()
+    else:
+        st.write("Feature importances not available for this model.")
+        return
+    order = np.argsort(imp)[::-1][:20]
+    names = [features[i] for i in order]
+    vals = imp[order]
+    fig, ax = plt.subplots(figsize=(6, max(3, 0.25*len(names))))
+    ax.barh(range(len(names)), vals[::-1])
+    ax.set_yticks(range(len(names)))
+    ax.set_yticklabels(names[::-1])
+    ax.set_xlabel("Relative importance")
+    ax.set_title(title)
+    st.pyplot(fig)
+
+def to_download_link(df, filename="data.csv"):
+    b = BytesIO()
+    df.to_csv(b, index=False)
+    b.seek(0)
+    return b
+
+# --------------------- Sidebar: Upload or sample ---------------------
+st.sidebar.header("Upload / Sample data")
+uploaded = st.sidebar.file_uploader("Upload CSV (HR dataset). If empty, you can use the sample HR dataset provided.", type=['csv'])
+
+use_sample = False
+if uploaded is None:
+    use_sample = st.sidebar.checkbox("Use sample HR dataset (synthetic)", value=True)
+    if use_sample:
+        # create a small synthetic HR dataset for demo
+        np.random.seed(42)
+        n = 500
+        sample = pd.DataFrame({
+            "EmployeeID": np.arange(n),
+            "JobRole": np.random.choice(["Sales","Engineer","HR","Manager","Support"], size=n, p=[0.25,0.35,0.1,0.15,0.15]),
+            "Gender": np.random.choice(["Male","Female"], size=n),
+            "MonthlyIncome": np.random.normal(5000,1200,size=n).astype(int),
+            "Satisfaction": np.round(np.random.beta(2,5,size=n)*100,1),
+            "Age": np.random.randint(22,60,size=n),
+            "YearsAtCompany": np.random.poisson(3,size=n),
+            "Attrition": np.random.choice([0,1], size=n, p=[0.85,0.15])
+        })
+        df = sample
+else:
+    df = load_csv(uploaded)
+
+st.sidebar.markdown("---")
+st.sidebar.write("Drop rows with any nulls before analysis (as requested).")
+drop_nulls = st.sidebar.checkbox("Drop rows with nulls", value=True)
+if drop_nulls:
+    df = df.dropna()
+
+st.write("Data preview (first 5 rows):")
+st.dataframe(df.head().reset_index(drop=True))
+
+# column mapping UI
+st.sidebar.header("Column mapping (if auto-detected not correct)")
+guesses = try_guess_columns(df)
+job_col = st.sidebar.selectbox("Job role column", options=[None]+list(df.columns), index=(list(df.columns).index(guesses['job'])+1 if guesses.get('job') in df.columns else 0))
+satis_col = st.sidebar.selectbox("Satisfaction column (numeric 0-100)", options=[None]+list(df.columns), index=(list(df.columns).index(guesses['satisfaction'])+1 if guesses.get('satisfaction') in df.columns else 0))
+target_col = st.sidebar.selectbox("Target / Attrition column (0/1)", options=[None]+list(df.columns), index=(list(df.columns).index(guesses['target'])+1 if guesses.get('target') in df.columns else 0))
+
+# Safety: require target selection for modeling/prediction tabs
+if target_col is None or target_col == "None":
+    st.sidebar.warning("Please select a target column to enable modeling and prediction tabs. You can still explore charts without selecting a target.")
+
+# Filters
+st.sidebar.header("Filters")
+job_filter_vals = []
+if job_col and job_col in df.columns:
+    job_filter_vals = sorted(df[job_col].dropna().unique().tolist())
+    job_selected = st.sidebar.multiselect("Filter by job role (multi-select)", options=job_filter_vals, default=job_filter_vals)
+else:
+    job_selected = []
+
+satis_min, satis_max = 0, 100
+if satis_col and satis_col in df.columns and pd.api.types.is_numeric_dtype(df[satis_col]):
+    smin = float(df[satis_col].min())
+    smax = float(df[satis_col].max())
+    satis_min, satis_max = st.sidebar.slider("Satisfaction range", min_value=float(smin), max_value=float(smax), value=(smin, smax))
+else:
+    # generic slider 0-100
+    satis_min, satis_max = st.sidebar.slider("Satisfaction range (no numeric column selected)", min_value=0.0, max_value=100.0, value=(0.0, 100.0))
+
+# Apply filters to dataframe for charts
+df_charts = df.copy()
+if job_col and job_col in df_charts.columns and job_selected:
+    df_charts = df_charts[df_charts[job_col].isin(job_selected)]
+if satis_col and satis_col in df_charts.columns and pd.api.types.is_numeric_dtype(df_charts[satis_col]):
+    df_charts = df_charts[(df_charts[satis_col] >= satis_min) & (df_charts[satis_col] <= satis_max)]
+
+# --------------------- Tabs ---------------------
+tab1, tab2, tab3 = st.tabs(["Dashboard (Charts)", "Models (Train & Eval)", "Predict (Upload & Predict)"])
+
+# --------------------- Dashboard Tab ---------------------
+with tab1:
+    st.header("Dashboard — 5 charts for retention insights")
+    st.markdown("Use the left-side filters (job role multi-select and satisfaction slider) to interact with all charts.")
+
+    # Chart 1: Attrition rate by Job Role (bar + %)
+    st.subheader("1) Attrition rate by Job Role")
+    if (job_col and job_col in df_charts.columns) and (target_col and target_col in df_charts.columns):
+        grp = df_charts.groupby(job_col)[target_col].agg(['count','mean']).reset_index().rename(columns={'mean':'attrition_rate'})
+        grp['attrition_pct'] = grp['attrition_rate']*100
+        chart = alt.Chart(grp).mark_bar().encode(
+            x=alt.X('attrition_pct:Q', title='Attrition %'),
+            y=alt.Y(f'{job_col}:N', sort='-x', title='Job Role'),
+            tooltip=[job_col, 'count', 'attrition_pct']
+        )
+        st.altair_chart(chart, use_container_width=True)
+        st.write("Interpretation: Higher attrition % by job role points to roles requiring attention (training, pay review, career path).")
+    else:
+        st.info("Select both job role and target column to view this chart.")
+
+    # Chart 2: Satisfaction vs Attrition scatter + LOESS-like smoothing (via binning)
+    st.subheader("2) Satisfaction vs Attrition (scatter with trend)")
+    if satis_col and satis_col in df_charts.columns and target_col and target_col in df_charts.columns:
+        # scatter plot with jitter
+        tmp = df_charts[[satis_col, target_col]].copy()
+        tmp['jitter'] = np.random.normal(0, 0.5, size=len(tmp))
+        tmp['s'] = tmp[target_col]*0.9 + tmp['jitter']
+        chart = alt.Chart(tmp).mark_circle(size=20, opacity=0.5).encode(
+            x=alt.X(f'{satis_col}:Q', title='Satisfaction'),
+            y=alt.Y(f'{target_col}:Q', title='Attrition (0/1)'),
+            tooltip=[satis_col, target_col]
+        )
+        # trend line by binning satisfaction and plotting mean attrition
+        bins = pd.cut(tmp[satis_col], bins=10)
+        trend = tmp.groupby(bins)[target_col].mean().reset_index()
+        trend['mid'] = trend[satis_col].apply(lambda x: x.mid if hasattr(x, 'mid') else np.nan)
+        base = alt.layer(chart, alt.Chart(trend).mark_line(color='red').encode(x='mid', y=target_col))
+        st.altair_chart(base, use_container_width=True)
+        st.write("Interpretation: Lower satisfaction bins with higher attrition suggest focusing on employee experience interventions.")
+    else:
+        st.info("Select satisfaction and target columns to view this chart.")
+
+    # Chart 3: Correlation heatmap for numeric features
+    st.subheader("3) Correlation heatmap (numeric features)")
+    num_cols = df_charts.select_dtypes(include=[np.number]).columns.tolist()
+    if len(num_cols) >= 2:
+        corr = df_charts[num_cols].corr()
+        fig, ax = plt.subplots(figsize=(8,6))
+        im = ax.imshow(corr, cmap='RdBu', vmin=-1, vmax=1)
+        ax.set_xticks(range(len(num_cols))); ax.set_xticklabels(num_cols, rotation=45, ha='right')
+        ax.set_yticks(range(len(num_cols))); ax.set_yticklabels(num_cols)
+        fig.colorbar(im, ax=ax)
+        st.pyplot(fig)
+        st.write("Interpretation: Look for numeric predictors strongly correlated with Attrition (positive or negative).")
+    else:
+        st.info("Need at least two numeric columns to show correlation heatmap.")
+
+    # Chart 4: Income distribution by job role (boxplot)
+    st.subheader("4) Income distribution by Job Role (boxplot)")
+    money_cols = [c for c in df_charts.columns if any(k in c.lower() for k in ('income','salary','pay','monthly','annual'))]
+    if job_col and job_col in df_charts.columns and money_cols:
+        money_col = st.selectbox("Choose income column for boxplot", options=money_cols, index=0)
+        fig, ax = plt.subplots(figsize=(10,5))
+        df_tmp = df_charts[[job_col, money_col]].dropna()
+        df_tmp.boxplot(column=money_col, by=job_col, ax=ax, rot=45)
+        plt.suptitle("")
+        ax.set_xlabel("Job Role"); ax.set_ylabel(money_col)
+        st.pyplot(fig)
+        st.write("Interpretation: Wide dispersion or low median for a role may warrant compensation review to improve retention.")
+    else:
+        st.info("Need job role column and an income/salary column to show income boxplots.")
+
+    # Chart 5: Attrition by YearsAtCompany buckets (stacked by JobRole or Gender)
+    st.subheader("5) Attrition by Tenure buckets (stacked by Job Role/Gender)")
+    tenure_candidates = [c for c in df_charts.columns if any(k in c.lower() for k in ('tenure','yearsatcompany','years','service'))]
+    if tenure_candidates and target_col and target_col in df_charts.columns:
+        tenure_col = tenure_candidates[0]
+        bins = [0,1,3,5,10,30]
+        df_charts['tenure_bucket'] = pd.cut(df_charts[tenure_col], bins=bins, labels=["<1","1-2","3-4","5-9","10+"])
+        stack_by = None
+        if job_col and job_col in df_charts.columns:
+            stack_by = job_col
+        else:
+            gender_candidates = [c for c in df_charts.columns if 'gender' in c.lower()]
+            stack_by = gender_candidates[0] if gender_candidates else None
+        if stack_by:
+            pivot = df_charts.groupby(['tenure_bucket', stack_by])[target_col].mean().reset_index()
+            chart = alt.Chart(pivot).mark_bar().encode(
+                x='tenure_bucket:O',
+                y=alt.Y(f'{target_col}:Q', title='Attrition rate'),
+                color=stack_by,
+                tooltip=[stack_by, 'tenure_bucket', f'{target_col}']
+            )
+            st.altair_chart(chart, use_container_width=True)
+            st.write("Interpretation: High attrition among new joiners suggests onboarding issues; among longer-tenured staff suggests career progression issues.")
+        else:
+            st.info("No suitable column found to stack by (JobRole or Gender).")
+    else:
+        st.info("No tenure-like column and/or target found to show tenure chart.")
+
+# --------------------- Models Tab ---------------------
+with tab2:
+    st.header("Train & Evaluate Models")
+    st.write("Map features & target, then click `Train Models` to run the three algorithms and view metrics.")
+    st.markdown("**Choose features (columns) to use for modeling. Non-numeric columns will be label-encoded automatically.**")
+
+    # feature selection UI
+    all_cols = df.columns.tolist()
+    default_features = [c for c in all_cols if c != target_col and c not in ('EmployeeID','ID','Name','FirstName','LastName')][:10]
+    feature_cols = st.multiselect("Select feature columns (leave empty to use all except target & common IDs)", options=all_cols, default=default_features)
+    if not feature_cols:
+        feature_cols = [c for c in all_cols if c != target_col and c not in ('EmployeeID','ID','Name','FirstName','LastName')]
+
+    test_size = st.slider("Test set proportion", 0.1, 0.5, 0.2, 0.05)
+    stratify_opt = st.checkbox("Stratify split by target (if categorical)", value=True)
+
+    train_button = st.button("Train Models")
+
+    if train_button:
+        # prepare data
+        df_model = df[[*feature_cols, target_col]].copy()
+        # drop NA (user requested ignore nulls in file)
+        df_model = df_model.dropna()
+        # label encode non-numeric
+        df_model_enc, encs = label_encode_df(df_model)
+        X = df_model_enc.drop(columns=[target_col])
+        y = df_model_enc[target_col]
+        # split with stratify if requested and possible
+        strat = y if stratify_opt and y.nunique() <= 20 and (y.value_counts()>=2).all() else None
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=strat)
+        st.success(f"Data prepared. Train shape: {X_train.shape}, Test shape: {X_test.shape}")
+
+        with st.spinner("Training models..."):
+            results = model_train_and_eval(X_train, X_test, y_train, y_test)
+
+        # show accuracies in table
+        acc_table = pd.DataFrame([{
+            "model": name,
+            "train_accuracy": res['train_acc'],
+            "test_accuracy": res['test_acc']
+        } for name, res in results.items()])
+        st.subheader("Model accuracies (train/test)")
+        st.dataframe(acc_table.set_index('model'))
+
+        # show confusion matrices and feature importances
+        for name, res in results.items():
+            st.subheader(f"{name} — Confusion Matrix and Classification Report")
+            cm = confusion_matrix(y_test, res['y_test_pred'], labels=np.unique(y_test))
+            plot_confusion(cm, labels=np.unique(y_test), title=f"{name} Confusion Matrix")
+            st.text("Classification report (test):")
+            st.text(classification_report(y_test, res['y_test_pred']))
+
+            st.markdown("**Feature importance / coefficients**")
+            plot_feature_importance(res['model'], X_train.columns.tolist(), title=f"{name} Feature Importance")
+
+        # store models in session_state for predict tab usage
+        st.session_state['trained_models'] = {name: res['model'] for name, res in results.items()}
+        st.session_state['encoders'] = encs
+        st.session_state['feature_cols'] = feature_cols
+        st.success("Models trained and saved in session for use in Predict tab.")
+
+# --------------------- Predict Tab ---------------------
+with tab3:
+    st.header("Upload new data and predict Attrition")
+    st.markdown("Upload a CSV and map columns. The app will label-encode non-numeric columns automatically using fresh encoders. If you trained models in the Models tab this session, you can use them here.")
+
+    upload_pred = st.file_uploader("Upload CSV to predict (it should contain same feature columns used for training)", type=['csv'], key="pred_upload")
+    chosen_model_name = None
+    if 'trained_models' in st.session_state:
+        chosen_model_name = st.selectbox("Choose model for prediction", options=list(st.session_state['trained_models'].keys()))
+    else:
+        st.info("Train models first in Models tab to enable trained-model predictions. You can also use auto-trained models by uploading a labeled dataset and pressing Train above.")
+
+    if upload_pred is not None and chosen_model_name is not None:
+        df_new = pd.read_csv(upload_pred)
+        st.write("Preview of uploaded data:")
+        st.dataframe(df_new.head())
+
+        # Drop rows with nulls (user wanted to ignore nulls)
+        df_new = df_new.dropna()
+
+        # ensure required feature columns exist
+        required = st.session_state.get('feature_cols', [])
+        missing = [c for c in required if c not in df_new.columns]
+        if missing:
+            st.warning(f"The uploaded file is missing these feature columns required for prediction: {missing}. Please upload a file with the right columns or modify feature selection in Models tab.")
+        else:
+            # prepare X_new: label-encode non-numeric columns using fresh encoders from training if possible, otherwise fit new encoders
+            X_new = df_new[required].copy()
+            encs = st.session_state.get('encoders', {})
+            for col in X_new.select_dtypes(include=['object','category']).columns:
+                if col in encs:
+                    le = encs[col]
+                    # map, unseen labels -> -1 then fill with new label encoding
+                    X_new[col] = X_new[col].astype(str).map(lambda v: le.transform([v])[0] if v in le.classes_ else -1)
+                    # for unknowns we can leave -1 or fit new: here leave -1
+                else:
+                    le = LabelEncoder()
+                    X_new[col] = le.fit_transform(X_new[col].astype(str))
+
+            model = st.session_state['trained_models'][chosen_model_name]
+            preds = model.predict(X_new)
+            df_out = df_new.copy()
+            df_out['Predicted_Attrition'] = preds
+            st.write("Predictions preview:")
+            st.dataframe(df_out.head())
+
+            # allow download
+            buffer = to_download_link(df_out)
+            st.download_button("Download predictions CSV", data=buffer, file_name="predictions.csv", mime="text/csv")
+
+st.markdown("---")
+st.caption("Package prepared for deployment on Streamlit Cloud. Upload the `app.py` to a GitHub repo and connect that repo to Streamlit Cloud.")
